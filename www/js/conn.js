@@ -240,8 +240,13 @@ var servConn = {
             return;
         }
         if (!this._isConnected) {
-            // do not wait for the next retry tick, try right now
-            if (!this._isHandshakeRunning()) {
+            // Hurry the next attempt up instead of waiting for its timer - but only if
+            // the client does not hold a socket right now. Its connect() does not close
+            // the old one, so a second socket would be created, the first one orphaned,
+            // and when the server drops the orphan the client tears down both. The
+            // client keeps `socket` at null exactly while it waits between two attempts,
+            // which is when hurrying up is safe.
+            if (!this._isHandshakeRunning() && !this._socket.socket) {
                 try {
                     this._socket.connect();
                 } catch (e) {
@@ -400,7 +405,12 @@ var servConn = {
                 }
                 if (typeof window !== 'undefined' && window.addEventListener) {
                     window.addEventListener('online', wakeUp, false);
-                    window.addEventListener('pageshow', wakeUp, false); // bfcache restore (iOS)
+                    window.addEventListener('pageshow', function (e) {
+                        // pageshow fires on EVERY load, not only on a bfcache restore -
+                        // acting on the normal load would open a second socket while the
+                        // first one is still shaking hands
+                        e && e.persisted && wakeUp();
+                    }, false);
                 }
             }
 
