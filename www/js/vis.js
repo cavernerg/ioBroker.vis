@@ -360,7 +360,13 @@ var vis = {
         }
 
         this.conn.setState(id, state[`${id}.val`], function (err) {
-            if (err) {
+            if (err === 'timeout') {
+                // The command was never acknowledged - the connection is dead without
+                // anybody having noticed yet. Saying "insufficient permissions" here
+                // would send the operator looking in entirely the wrong place.
+                console.warn(`setState ${id} lost, no connection`);
+                that.showMessage(`${id}: ${_('No connection')}`, _('No connection'), 'alert', 600);
+            } else if (err) {
                 //state[id + '.val'] = oldValue;
                 that.showMessage(_('Cannot execute %s for %s, because of insufficient permissions', 'setState', id), _('Insufficient permissions'), 'alert', 600);
             }
@@ -2216,7 +2222,9 @@ var vis = {
         for (var i = 0, len = this.onChangeCallbacks.length; i < len; i++) {
             if (this.onChangeCallbacks[i].callback === callback &&
                 (arg === undefined || arg === null || this.onChangeCallbacks[i].arg === arg)) {
-                this.onChangeCallbacks.slice(i, 1);
+                // was slice(), which builds a copy and throws it away - the entry stayed
+                // registered for good and was called on every single state change
+                this.onChangeCallbacks.splice(i, 1);
                 return;
             }
         }
@@ -3136,6 +3144,15 @@ var vis = {
 
         // Bindings on every element
         if (!this.editMode && this.bindings[id]) {
+            // A binding expression is indexed under EVERY OID it mentions, so the same
+            // widget appears many times in this list - the top app bar of this project
+            // holds 80 theme attributes bound to one OID. Re-rendering per ENTRY meant
+            // destroying and rebuilding that one widget 80 times for a single state
+            // change (measured: 1.7 s of blocked main thread on a kiosk tablet).
+            // Update all attributes first, then render every affected widget once; the
+            // result is the same DOM the last of those 80 renders produced.
+            var toRender = [];
+            var seenWidget = {};
             for (var i = 0; i < this.bindings[id].length; i++) {
                 var widget = this.views[this.bindings[id][i].view].widgets[this.bindings[id][i].widget];
                 var value = this.formatBinding(this.bindings[id][i].format, this.bindings[id][i].view, this.bindings[id][i].widget, widget);
@@ -3148,7 +3165,14 @@ var vis = {
                 this.subscribeOidAtRuntime(value);
                 this.visibilityOidBinding(this.bindings[id][i], value);
 
-                this.reRenderWidget(this.bindings[id][i].view, this.bindings[id][i].view, this.bindings[id][i].widget);
+                var renderKey = `k${this.bindings[id][i].view}\u0000${this.bindings[id][i].widget}`;
+                if (!seenWidget[renderKey]) {
+                    seenWidget[renderKey] = true;
+                    toRender.push(this.bindings[id][i]);
+                }
+            }
+            for (var r = 0; r < toRender.length; r++) {
+                this.reRenderWidget(toRender[r].view, toRender[r].view, toRender[r].widget);
             }
         }
 
