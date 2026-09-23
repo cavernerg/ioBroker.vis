@@ -68,7 +68,24 @@ var servConn = {
     _objects:           null,        // used if _useStorage === true
     _enums:             null,        // used if _useStorage === true
     _autoSubscribe:     true,
+    _subscribed:        [],          // every state pattern subscribed on this connection
+    _getStatesQueue:    [],          // getStates calls waiting for the running one
     namespace:          'vis.0',
+
+    _releaseGetStates: function () {
+        // Setting the counter to 0 instead of decrementing also keeps it from going
+        // negative when the disconnect handler has already reset it while an answer was
+        // still on its way.
+        this.gettingStates = 0;
+        // Wake waiters until one of them actually takes the slot. One that bails out
+        // early - no connection any more, or an empty list that needs no request - must
+        // not strand the ones behind it; the polling this replaces could not deadlock
+        // that way, so neither may the queue. Every round removes one entry, so this
+        // always terminates.
+        while (!this.gettingStates && this._getStatesQueue.length) {
+            this._getStatesQueue.shift()();
+        }
+    },
 
     getType:          function () {
         return this._type;
@@ -138,6 +155,16 @@ var servConn = {
         this._autoSubscribe && this._socket.emit('subscribe', '*');
         objectsRequired && this._socket.emit('subscribeObjects', '*');
 
+        // Subscriptions live on the server PER SOCKET, so a new socket starts without a
+        // single one. Repeat everything that was subscribed before. This matters most
+        // for widgets that subscribe from their own code (custom HTML dashboards):
+        // vis re-subscribes only the IDs of its native widgets after a reconnect, so
+        // without this the dashboards keep their values frozen and nobody notices -
+        // until now only the forced page reload covered this up.
+        if (this._subscribed.length) {
+            this._socket.emit('subscribe', this._subscribed.slice());
+        }
+
         if (this._isConnected === true) {
             // This seems to be a reconnect because we're already connected!
             // -> prevent firing onConnChange twice
@@ -155,23 +182,54 @@ var servConn = {
             }, 0);
         }
     },
+    _isSelfReconnecting: function () {
+        // The pure WebSocket client (@iobroker/ws) retries on its own, socket.io with
+        // "reconnection: false" does not.
+        return !!(this._socket && typeof this._socket._reconnect === 'function');
+    },
+    _isHandshakeRunning: function () {
+        // connectingTimer is set while the client waits for the READY flag of a socket
+        // it has just opened. A pending backoff timer (connectTimer) is explicitly NOT
+        // checked here: pulling that attempt forward is exactly what we want.
+        return !!(this._socket && this._socket.connectingTimer);
+    },
     reconnect:        function (connOptions) {
         var that = this;
         if (++this._reconnectionCount >= 5) {
             this._reconnectionCount = 0; // reset counter
-            // try reload instead
-            this.reload();
-            return;
+            // Escalate to a page reload only when there is no better way: a client that
+            // reconnects on its own restores the session via the 'reconnect' event, and
+            // while the browser knows it is offline a reload would only land on the
+            // browser's error page - with the view gone for good.
+            if (!this._isSelfReconnecting() && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+                this.reload();
+                return;
+            }
         }
         // reconnect
         if ((!connOptions.mayReconnect || connOptions.mayReconnect()) && !this._connectInterval) {
+            // A client that reconnects on its own has to stay the only owner of the
+            // socket. Its connect() does not close the previous WebSocket, it just
+            // replaces the reference - so a second driver here produces two live
+            // sockets: the server authenticates and subscribes one of them while the
+            // client reads from the other. The page is then "connected" but never
+            // receives a single state update again. Only drive the retries for a client
+            // that does not retry by itself; the countdown keeps running either way.
+            var driveReconnect = !this._isSelfReconnecting();
             this._connectInterval = setInterval(function () {
-                console.log('Trying connect...');
-                that._socket.connect();
                 that._countDown = Math.floor(that._reconnectInterval / 1000);
                 if (typeof $ !== 'undefined') {
                     $('.splash-screen-text').html(that._countDown + '...').css('color', 'red');
                 }
+                // Never interrupt a handshake that is already running: the pure WebSocket
+                // client needs up to connectTimeout for it and a connect() call in between
+                // throws the pending socket away. With a reconnectInterval shorter than
+                // that timeout the connection could never be established at all.
+                if (!driveReconnect || that._isHandshakeRunning()) {
+                    return;
+                }
+                console.log('Trying connect...');
+                that._socket.connect();
             }, this._reconnectInterval);
 
             this._countDown = Math.floor(this._reconnectInterval / 1000);
@@ -181,10 +239,89 @@ var servConn = {
 
             this._countInterval = setInterval(function () {
                 that._countDown--;
+                if (that._countDown < 0) {
+                    // the next attempt may be deferred by a running handshake - do not
+                    // count into the negative, that only looks broken
+                    that._countDown = Math.floor(that._reconnectInterval / 1000);
+                }
                 if (typeof $ !== 'undefined') {
                     $('.splash-screen-text').html(that._countDown + '...');
                 }
             }, 1000);
+        }
+    },
+    _wakeUpCheck:     function () {
+        var that = this;
+        if (!this._socket || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) {
+            return;
+        }
+        if (!this._isConnected) {
+            // Hurry the next attempt up instead of waiting for its timer - but only if
+            // the client does not hold a socket right now. Its connect() does not close
+            // the old one, so a second socket would be created, the first one orphaned,
+            // and when the server drops the orphan the client tears down both. The
+            // client keeps `socket` at null exactly while it waits between two attempts,
+            // which is when hurrying up is safe.
+            if (!this._isHandshakeRunning() && !this._socket.socket) {
+                try {
+                    this._socket.connect();
+                } catch (e) {
+                    // ignore
+                }
+            }
+            return;
+        }
+        // We believe we are connected - verify it, the socket may be dead silently
+        if (this._aliveCheckRunning) {
+            return;
+        }
+
+        // Ask the cheap question first. The pure WebSocket client refreshes lastPong on
+        // EVERY incoming frame, so its age is exactly the measure the client itself uses
+        // to declare a connection dead - and after the realistic wake-up (phone locked
+        // for minutes, timers frozen) it is far past the limit. Deciding from it saves
+        // the whole probe, which is where almost all of the measured 4s went.
+        var silence = this._socketSilence();
+        if (silence !== null && silence > (this._socket.options && this._socket.options.pongTimeout || 6000)) {
+            console.log(`Socket silent for ${Math.round(silence / 1000)}s at wake up => reconnect`);
+            this._closeSocket();
+            return;
+        }
+
+        this._aliveCheckRunning = true;
+        var answered = false;
+        try {
+            this._socket.emit('getVersion', function () {
+                answered = true;
+            });
+        } catch (e) {
+            answered = false;
+        }
+        // A healthy connection answers in single-digit milliseconds; 1.5s is already
+        // generous and is only reached in the grey zone the check above did not settle.
+        setTimeout(function () {
+            that._aliveCheckRunning = false;
+            if (!answered && that._isConnected) {
+                console.log('No answer from server after wake up => reconnect');
+                that._closeSocket();
+            }
+        }, 1500);
+    },
+    _socketSilence:   function () {
+        // Milliseconds since the last frame from the server, or null if the client does
+        // not track it (socket.io).
+        if (!this._socket || typeof this._socket.lastPong !== 'number' || !this._socket.lastPong) {
+            return null;
+        }
+        return Date.now() - this._socket.lastPong;
+    },
+    _closeSocket:     function () {
+        // close() of the ws client always schedules a reconnect on its own - there is no
+        // flag that would switch that off, so this never leaves the page unconnected.
+        try {
+            this._socket.close ? this._socket.close() : this._socket.disconnect();
+        } catch (e) {
+            // ignore
         }
     },
     reload:           function () {
@@ -287,18 +424,97 @@ var servConn = {
                 reconnection:                   false,
                 upgrade:                        !connOptions.socketForceWebSockets,
                 rememberUpgrade:                connOptions.socketForceWebSockets,
-                transports:                     connOptions.socketForceWebSockets ? ['websocket'] : undefined
+                transports:                     connOptions.socketForceWebSockets ? ['websocket'] : undefined,
+                // Options of the pure WebSocket client (@iobroker/ws). It ignores every
+                // socket.io option above. Its default pongTimeout of 60s means that a
+                // silently dropped connection (no FIN, e.g. Wi-Fi gone) is noticed only
+                // after a minute, and the view shows stale values until then.
+                //
+                // pongTimeout counts "no message of ANY kind since", not "no pong for
+                // this ping", so the tolerance against lost packets is
+                // floor(pongTimeout / pingInterval) - 1 cycles: 2 here, the same as with
+                // 5000/15000. What changes is how fast a dead line is noticed: measured
+                // 12-17s with 5000/15000, 6s with these values, while re-connecting takes
+                // 8ms and restoring the values 130ms. A false alarm used to cost a 28s
+                // page reload, which is what justified the cautious setting; since this
+                // fork it costs those 8ms, so there is nothing left to be cautious about.
+                // The server pings after 5s of silence and closes after 15s (hard-coded
+                // in @iobroker/ws-server), so pinging more often keeps it quiet.
+                pongTimeout:                    parseInt(connOptions.pongTimeout, 10)     || 6000,
+                pingInterval:                   parseInt(connOptions.pingInterval, 10)    || 2000,
+                // Covers the WHOLE handshake up to the server's ready flag, including its
+                // ACL lookup - not just the TCP connect. The client's default is 3000;
+                // on a loaded host that is tight, and overrunning it throws the pending
+                // socket away and starts over.
+                connectTimeout:                 parseInt(connOptions.connectTimeout, 10)  || 6000,
+                connectInterval:                parseInt(connOptions.connectInterval, 10) || 1000
             });
 
-            this._socket.on('connect', function () {
+            // A tab that was in the background (phone locked, laptop closed) often comes
+            // back with a socket that is dead without anybody having noticed yet. Check
+            // it the moment the user returns instead of waiting for the next timer tick.
+            if (!this._wakeUpBound) {
+                this._wakeUpBound = true;
+                var wakeUp = function () {
+                    that._wakeUpCheck();
+                };
+                if (typeof document !== 'undefined' && document.addEventListener) {
+                    document.addEventListener('visibilitychange', wakeUp, false);
+                }
+                if (typeof window !== 'undefined' && window.addEventListener) {
+                    window.addEventListener('online', wakeUp, false);
+                    window.addEventListener('pageshow', function (e) {
+                        // pageshow fires on EVERY load, not only on a bfcache restore -
+                        // acting on the normal load would open a second socket while the
+                        // first one is still shaking hands
+                        e && e.persisted && wakeUp();
+                    }, false);
+                }
+            }
+
+            var lastHandledSocket = null;
+
+            var onConnect = function () {
+                var raw = that._socket ? that._socket.socket : null; // the real WebSocket
+                if (raw) {
+                    if (raw === lastHandledSocket) {
+                        // same connection, already restored
+                        return;
+                    }
+                    lastHandledSocket = raw;
+                    // This is a DIFFERENT connection than the one restored last: while we
+                    // were busy the client may have thrown its socket away and opened a
+                    // new one. Force the full restore for it, because _onAuth() bails out
+                    // with "we are already connected" otherwise - and then this socket
+                    // never sends 'subscribe'. The page looks connected, answers requests
+                    // and stays mute for good: no state ever arrives again.
+                    that._isConnected = false;
+                } else if (that._lastConnectHandled && Date.now() - that._lastConnectHandled < 1000) {
+                    // socket.io (no raw socket exposed) fires 'connect' AND 'reconnect'
+                    // for the same connection - restore it only once
+                    return;
+                }
+                that._lastConnectHandled = Date.now();
                 that._reconnectionCount = 0; // reset counter
+
+                // Disarm the watchdog of a PREVIOUS connection before arming a new one
+                // below - the assignment further down only overwrites the reference, the
+                // old timer keeps running and would reload the page although this
+                // connection is healthy.
+                if (that.waitConnect) {
+                    clearTimeout(that.waitConnect);
+                    that.waitConnect = null;
+                }
 
                 if (that._disconnectedSince) {
                     var offlineTime = Date.now() - that._disconnectedSince;
                     console.log('was offline for ' + (offlineTime / 1000) + 's');
 
-                    // reload whole page if no connection longer than some period
-                    if (that._reloadInterval && offlineTime > that._reloadInterval * 1000 && !that.authError) {
+                    // Reload the whole page only when authentication is in use, because
+                    // then the session may have expired while we were offline. Without
+                    // authentication there is nothing to renew and this handler restores
+                    // views and all states anyway - without throwing the page away.
+                    if (that._reloadInterval && offlineTime > that._reloadInterval * 1000 && !that.authError && that._isSecure) {
                         that.reload();
                     }
 
@@ -329,7 +545,12 @@ var servConn = {
                     }
                     that.waitConnect = setTimeout(function() {
                         console.error('No answer from server');
-                        if (!that.authError) {
+                        // Same reasoning as the offline-too-long reload above: only an
+                        // authenticated session has something a reload could renew.
+                        // Without authentication a reload would throw the page away for
+                        // a server that is merely slow to answer; the ping/pong watchdog
+                        // of the socket takes care of a connection that is really dead.
+                        if (!that.authError && that._isSecure) {
                             that.reload();
                         }
                     }, timeOut);
@@ -349,7 +570,16 @@ var servConn = {
                         }
                     });
                 }, 50);
-            });
+            };
+
+            this._socket.on('connect', onConnect);
+
+            // The pure WebSocket client fires 'connect' only for the very first
+            // connection and 'reconnect' for every later one. Without this line the VIS
+            // session is never restored after a reconnect: the socket is up again, but
+            // nothing re-subscribes or re-reads the states, so the only way out is the
+            // emergency page reload above.
+            this._socket.on('reconnect', onConnect);
 
             this._socket.on('reauthenticate', function (err) {
                 if (that._connCallbacks.onConnChange) {
@@ -383,6 +613,27 @@ var servConn = {
             this._socket.on('disconnect', function () {
                 that._disconnectedSince = Date.now();
 
+                // Every request that was in flight is lost now - the client drops all
+                // pending callbacks on close. Release the getStates guard here, because
+                // a callback that never comes leaves it above zero and then EVERY later
+                // getStates() blocks forever: the views keep their stale values and never
+                // subscribe again. Until now the forced page reload hid this.
+                that.gettingStates = 0;
+                // Waiters would only run into the closed connection; drop them instead of
+                // leaving them queued for a socket that no longer exists.
+                that._getStatesQueue = [];
+
+                // The 6s "no answer from server" watchdog of onConnect only ever gets
+                // cleared by the answer itself. Leaving it armed across a disconnect means
+                // it fires after the NEXT connect succeeded - and reloads the page, which
+                // is exactly what this fork exists to avoid. It became reachable when
+                // onConnect was bound to 'reconnect' as well, so onConnect now runs more
+                // than once.
+                if (that.waitConnect) {
+                    clearTimeout(that.waitConnect);
+                    that.waitConnect = null;
+                }
+
                 // called only once when connection lost (and it was here before)
                 that._isConnected = false;
                 if (that._connCallbacks.onConnChange) {
@@ -407,18 +658,6 @@ var servConn = {
 
                 // reconnect
                 that.reconnect(connOptions);
-            });
-
-            // after reconnect the "connect" event will be called
-            this._socket.on('reconnect', function () {
-                var offlineTime = Date.now() - that._disconnectedSince;
-                console.log('was offline for ' + (offlineTime / 1000) + 's');
-
-                // reload whole page if no connection longer than one minute
-                if (that._reloadInterval && offlineTime > that._reloadInterval * 1000) {
-                    that.reload();
-                }
-                // anyway "on connect" is called
             });
 
             this._socket.on('objectChange', function (id, obj) {
@@ -536,7 +775,25 @@ var servConn = {
             callback && callback(version || error);
         });
     },
+    _rememberSubscribe: function (idOrArray, remove) {
+        var list = Array.isArray(idOrArray) ? idOrArray : [idOrArray];
+        for (var i = 0; i < list.length; i++) {
+            if (!list[i]) {
+                continue;
+            }
+            var pos = this._subscribed.indexOf(list[i]);
+            if (remove) {
+                pos !== -1 && this._subscribed.splice(pos, 1);
+            } else if (pos === -1) {
+                this._subscribed.push(list[i]);
+            }
+        }
+    },
     subscribe:        function (idOrArray, callback) {
+        // Remember it even if the command cannot be sent right now: the server keeps
+        // subscriptions per socket, so everything has to be repeated on a new one.
+        this._rememberSubscribe(idOrArray);
+
         if (!this._checkConnection('subscribe', arguments)) {
             return;
         }
@@ -544,6 +801,8 @@ var servConn = {
         this._socket.emit('subscribe', idOrArray, callback);
     },
     unsubscribe:      function (idOrArray, callback) {
+        this._rememberSubscribe(idOrArray, true);
+
         if (!this._checkConnection('unsubscribe', arguments)) {
             return;
         }
@@ -770,7 +1029,32 @@ var servConn = {
             //console.log('socket.io not initialized');
             return;
         }
-        this._socket.emit('setState', pointId, value, callback);
+        var that = this;
+        // A command sent into a silently dropped connection is simply gone: the frame is
+        // written, no error is raised, and the ws client neither checks the connection
+        // here nor times out its callbacks (its own timeout is dead code in the shipped
+        // build). Measured: 3s after a silent drop the page still believes it is
+        // connected, the emit does not throw, and the callback never arrives. For the
+        // operator that means a tap on a light switch does nothing and says nothing.
+        // Insist on an acknowledgement so at least the caller finds out.
+        var done = false;
+        var timer = setTimeout(function () {
+            if (done) {
+                return;
+            }
+            done = true;
+            console.warn(`setState ${pointId} was not acknowledged within 5s`);
+            callback && callback('timeout');
+        }, 5000);
+
+        this._socket.emit('setState', pointId, value, function (err) {
+            if (done) {
+                return;
+            }
+            done = true;
+            clearTimeout(timer);
+            callback && callback(err);
+        });
     },
     sendTo:         function (instance, command, payload, callback) {
         //socket.io
@@ -781,40 +1065,79 @@ var servConn = {
         this._socket.emit('sendTo', instance, command, payload, callback);
     },
     // callback(err, data)
-    getStates:        function (IDs, callback) {
+    getStates:        function (IDs, callback, _attempt) {
         if (typeof IDs === 'function') {
             callback = IDs;
             IDs = null;
         }
+        var attempt = _attempt || 1;
 
         if (this._type === 'local') {
             return callback(null, []);
-        } else {
-            if (!this._checkConnection('getStates', arguments)) {
-                return;
-            }
-            var that = this;
-            this.gettingStates = this.gettingStates || 0;
-            if (this.gettingStates > 0) {
-                // fix for slow devices -> if getStates still in progress, wait and try again
-                console.log('Trying to get states again, because emitted getStates still pending');
-                setTimeout(function () {
-                    that.getStates(IDs, callback);
-                }, 50);
-                return;
-            }
-
-            this.gettingStates++;
-
-            this._socket.emit('getStates', IDs, function (err, data) {
-                that.gettingStates--;
-                if (err || !data) {
-                    callback && callback(err || 'Authentication required');
-                } else if (callback) {
-                    callback(null, data);
-                }
-            });
         }
+
+        // An empty list can only ever be answered with {}. vis asks for exactly this
+        // while booting - subscribing.active is still empty at that point, because the
+        // views subscribe later from renderView. Do not spend a roundtrip on it.
+        if (Array.isArray(IDs) && !IDs.length) {
+            callback && setTimeout(function () {
+                callback(null, {});
+            }, 0);
+            return;
+        }
+
+        if (!this._checkConnection('getStates', arguments)) {
+            return;
+        }
+        var that = this;
+        this.gettingStates = this.gettingStates || 0;
+        if (this.gettingStates > 0) {
+            // Only one request at a time - that part is original, it protects slow
+            // devices. The original polled every 50 ms for the free slot, which costs
+            // ~50 ms per queued call, and vis issues four of them while booting. Line
+            // up and be woken instead.
+            this._getStatesQueue.push(function () {
+                that.getStates(IDs, callback, attempt);
+            });
+            return;
+        }
+
+        this.gettingStates++;
+
+        // Safety net for an answer that never arrives (socket replaced or closed while
+        // the request was in flight): the ws client drops pending callbacks without
+        // calling them, and its own callback timeout is dead code in the shipped build.
+        // Retry a few times, then fail loudly - retrying for ever would only hammer a
+        // server that is merely slow, and the caller would never learn about it.
+        var answered = false;
+        var guard = setTimeout(function () {
+            if (answered) {
+                return;
+            }
+            answered = true;
+            that._releaseGetStates();
+            if (attempt >= 3) {
+                console.error(`getStates got no answer in ${attempt} attempts => giving up`);
+                callback && callback('timeout');
+                return;
+            }
+            console.warn(`getStates got no answer within 10s => try again (${attempt + 1}/3)`);
+            that.getStates(IDs, callback, attempt + 1);
+        }, 10000);
+
+        this._socket.emit('getStates', IDs, function (err, data) {
+            if (answered) {
+                return;
+            }
+            answered = true;
+            clearTimeout(guard);
+            that._releaseGetStates();
+            if (err || !data) {
+                callback && callback(err || 'Authentication required');
+            } else if (callback) {
+                callback(null, data);
+            }
+        });
     },
     _fillChildren:    function (objects) {
         var items = [];

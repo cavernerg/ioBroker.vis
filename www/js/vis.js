@@ -360,7 +360,13 @@ var vis = {
         }
 
         this.conn.setState(id, state[`${id}.val`], function (err) {
-            if (err) {
+            if (err === 'timeout') {
+                // The command was never acknowledged - the connection is dead without
+                // anybody having noticed yet. Saying "insufficient permissions" here
+                // would send the operator looking in entirely the wrong place.
+                console.warn(`setState ${id} lost, no connection`);
+                that.showMessage(`${id}: ${_('No connection')}`, _('No connection'), 'alert', 600);
+            } else if (err) {
                 //state[id + '.val'] = oldValue;
                 that.showMessage(_('Cannot execute %s for %s, because of insufficient permissions', 'setState', id), _('Insufficient permissions'), 'alert', 600);
             }
