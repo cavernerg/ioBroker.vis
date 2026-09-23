@@ -99,7 +99,11 @@ async function writeFile(fileName) {
             if (typeof data === 'object') {
                 data = data.file;
             }
-            if (data && data !== index) {
+            // "!data" belongs in here: if the File-DB copy is missing (or the read
+            // above failed and was swallowed), the old condition wrote nothing at all
+            // and returned false - no upload, no cache.manifest bump, no log line. The
+            // adapter then could not repair a deleted vis/index.html on a restart.
+            if (!data || data !== index) {
                 fs.writeFileSync(`${__dirname}/www/${fileName}`, index);
                 await adapter.writeFileAsync(adapterName, fileName, index);
                 return true;
@@ -115,6 +119,13 @@ function upload() {
 
         const file = path.join(utils.controllerDir, 'iobroker.js');
         const child = require('child_process').spawn('node', [file, 'upload', adapter.name, 'widgets']);
+        // Without this handler a failing spawn (no node in PATH, EACCES) throws an
+        // uncaught exception AND never settles this promise - the run then hangs until
+        // the controller times it out.
+        child.on('error', err => {
+            adapter.log.error(`Cannot start upload: ${err.message}`);
+            resolve(1);
+        });
         let count = 0;
         child.stdout.on('data', data => {
             count++;
@@ -134,10 +145,23 @@ function upload() {
 
 async function updateCacheManifest() {
     adapter.log.info('Changes in index.html detected => update cache.manifest');
-    let data = fs.readFileSync(`${__dirname}/www/cache.manifest`).toString();
+    const manifest = `${__dirname}/www/cache.manifest`;
+    // Neither the file nor the "# dev build" line is guaranteed to exist. Without these
+    // two checks a missing file or a manifest without that line throws, and because
+    // main() had no handler the whole run died with an unhandled rejection instead of
+    // stopping cleanly - leaving index.html on its old state.
+    if (!fs.existsSync(manifest)) {
+        adapter.log.warn('cache.manifest not found - skipping the build counter');
+        return;
+    }
+    let data = fs.readFileSync(manifest).toString();
     const build = data.match(/# dev build ([0-9]+)/);
+    if (!build) {
+        adapter.log.warn('cache.manifest has no "# dev build" line - skipping the build counter');
+        return;
+    }
     data = data.replace(/# dev build [0-9]+/, `# dev build ${parseInt(build[1] || 0, 10) + 1}`);
-    fs.writeFileSync(`${__dirname}/www/cache.manifest`, data);
+    fs.writeFileSync(manifest, data);
 
     await adapter.writeFileAsync(adapterName, 'cache.manifest', data);
 }
@@ -232,8 +256,15 @@ async function main() {
         });
     }
 
-    const filesChanged = await generatePages();
-    await checkFiles(filesChanged);
+    // Anything thrown in here used to become an unhandled rejection, which on modern
+    // node ends the process with exit code 1 instead of the clean "Terminated
+    // (NO_ERROR)" - and skipped adapter.stop(). Report it and stop properly.
+    try {
+        const filesChanged = await generatePages();
+        await checkFiles(filesChanged);
+    } catch (e) {
+        adapter.log.error(`Cannot generate pages: ${(e && e.message) || e}`);
+    }
     adapter.stop();
 }
 
