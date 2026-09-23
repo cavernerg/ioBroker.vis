@@ -322,6 +322,23 @@
         }
     });
 
+    // setInterval for a widget element. The five refresh timers below used to run with
+    // no handle and no clearInterval: every re-render or destroyed view left one more
+    // timer behind, still refreshing a detached element forever. This one ends itself
+    // once its element is out of the document (vis never keeps views detached for
+    // longer than a synchronous move, so that is the widget being gone).
+    vis.binds.basicInterval = function (el, fn, interval) {
+        var node = el && el.jquery ? el[0] : el;
+        var handle = setInterval(function () {
+            if (!node || !node.isConnected) {
+                clearInterval(handle);
+                return;
+            }
+            fn();
+        }, interval);
+        return handle;
+    };
+
     vis.binds.stateful = {
         view: function (el, viewArr, persistent, notIfInvisible) {
             var $this = $(el);
@@ -369,7 +386,10 @@
                 if (timer) {
                     clearTimeout(timer)
                 }
-                timer = setTimeout(() => draw(newVal), 50);
+                // Coalesce changes that arrive in the same tick - that is all this
+                // timer has to do. It used to wait a fixed 50 ms, measured as the
+                // biggest fixed share of every view switch.
+                timer = setTimeout(() => draw(newVal), 0);
             }
 
             if (oid) {
@@ -410,7 +430,7 @@
                 }
 
                 if (refreshInterval > 0) {
-                    setInterval(function () {
+                    vis.binds.basicInterval($this, function () {
                         var val = vis.states[oid + '.val'] || 0;
                         if (val === 'true'  || val === true)  val = 1;
                         if (val === 'false' || val === false) val = 0;
@@ -448,7 +468,7 @@
                 }
 
                 if (refreshInterval > 0) {
-                    setInterval(function () {
+                    vis.binds.basicInterval($this, function () {
                         var val = vis.states[oid + '.val'] || 0;
                         if (val === 'true'  || val === true)  val = 1;
                         if (val === 'false' || val === false) val = 0;
@@ -1157,7 +1177,7 @@
                     });
                 }
                 if (refreshInterval > 0) {
-                    setInterval(function () {
+                    vis.binds.basicInterval($this, function () {
                         if ($this.is(':visible')) {
                             var p = $this.parents(':hidden');
                             if (!p.length || p[0].tagName === 'BODY' || p[0].id === 'materialdesign-vuetify-container') {
@@ -1178,7 +1198,7 @@
             refreshInterval = parseInt(refreshInterval, 10) || 0;
             if (html && !vis.editMode && refreshInterval > 0) {
                 var $this = $(el);
-                setInterval(function () {
+                vis.binds.basicInterval($this, function () {
                     if ($this.is(':visible')) {
                         var p = $this.parents(':hidden');
                         if (!p.length || p[0].tagName === 'BODY' || p[0].id === 'materialdesign-vuetify-container') {
@@ -1221,7 +1241,7 @@
                     });
                 }
                 if (refreshInterval > 0) {
-                    setInterval(function () {
+                    vis.binds.basicInterval($this, function () {
                         if ($this.is(':visible')) {
                             var p = $this.parents(':hidden');
                             if (!p.length || p[0].tagName === 'BODY' || p[0].id === 'materialdesign-vuetify-container') {
