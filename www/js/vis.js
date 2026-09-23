@@ -1154,7 +1154,9 @@ var vis = {
         var widget;
         var mWidget;
         if (!(filter || '').trim()) {
-            // show all
+            // show all - and forget the filter, otherwise isWidgetFilteredOut() would
+            // hide these widgets again on their next re-render
+            this.viewsActiveFilter[view] = [];
             for (widget in widgets) {
                 if (!widgets.hasOwnProperty(widget)) {
                     continue;
@@ -1183,7 +1185,8 @@ var vis = {
             }, parseInt(showDuration) + 10);
 
         } else if (filter === '$') {
-            // hide all
+            // hide all - '$' matches no filter key, so a re-render keeps them hidden
+            this.viewsActiveFilter[view] = ['$'];
             for (widget in widgets) {
                 if (!widgets.hasOwnProperty(widget)) {
                     continue;
@@ -1200,8 +1203,9 @@ var vis = {
                 $('#' + widget).hide(hideEffect, null, parseInt(hideDuration));
             }
         } else {
-            this.viewsActiveFilter[this.activeView] = filter.split(',');
-            var vFilters = this.viewsActiveFilter[this.activeView];
+            // stored under the view whose widgets are filtered below (was activeView)
+            this.viewsActiveFilter[view] = filter.split(',');
+            var vFilters = this.viewsActiveFilter[view];
             for (widget in widgets) {
                 if (!widgets.hasOwnProperty(widget) || !widgets[widget] || !widgets[widget].data) {
                     continue;
@@ -1213,22 +1217,7 @@ var vis = {
                         widgets[widget].data.filterkey = wFilters.split(/[;,]+/);
                         wFilters = widgets[widget].data.filterkey;
                     }
-                    var found = false;
-                    // optimization
-                    if (wFilters.length === 1) {
-                        found = vFilters.indexOf(wFilters[0]) !== -1;
-                    } else if (vFilters.length === 1) {
-                        found = wFilters.indexOf(vFilters[0]) !== -1;
-                    } else {
-                        for (var f = 0; f < wFilters.length; f++) {
-                            if (vFilters.indexOf(wFilters[f]) !== -1) {
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (!found) {
+                    if (!this.isFilterMatch(wFilters, vFilters)) {
                         mWidget = document.getElementById(widget);
                         if (mWidget &&
                             mWidget._customHandlers &&
@@ -1257,11 +1246,9 @@ var vis = {
                     if (mWidget &&
                         mWidget._customHandlers &&
                         mWidget._customHandlers.onShow) {
-                        if (widgets[widget] && widgets[widget].data && widgets[widget].data.filterkey) {
-                            if (!(that.viewsActiveFilter[that.activeView].length > 0 &&
-                                that.viewsActiveFilter[that.activeView].indexOf(widgets[widget].data.filterkey) === -1)) {
-                                mWidget._customHandlers.onShow(mWidget, widget);
-                            }
+                        if (widgets[widget] && widgets[widget].data && widgets[widget].data.filterkey &&
+                            !that.isWidgetFilteredOut(view, widget)) {
+                            mWidget._customHandlers.onShow(mWidget, widget);
                         }
                     }
                 }
@@ -2308,16 +2295,30 @@ var vis = {
             return (condition === 'not exist');
         }
     },
+    // true if the widget has filter keys and none of them is in the active filter
+    isFilterMatch:      function (wFilters, vFilters) {
+        if (typeof wFilters !== 'object') {
+            wFilters = String(wFilters).split(/[;,]+/);
+        }
+        for (var f = 0; f < wFilters.length; f++) {
+            if (vFilters.indexOf(wFilters[f]) !== -1) {
+                return true;
+            }
+        }
+        return false;
+    },
     isWidgetFilteredOut: function (view, widget) {
-        var w = this.views[view].widgets[widget];
+        // "widget" is the widget ID. This used to read widget.data - a property of the
+        // ID string, always undefined - so the function never returned true and every
+        // re-render brought a filtered widget back.
+        var w = this.views[view] && this.views[view].widgets[widget];
         var v = this.viewsActiveFilter[view];
-        return (w &&
-        w.data &&
-        w.data.filterkey &&
-        widget &&
-        widget.data &&
-        v.length > 0 &&
-        v.indexOf(widget.data.filterkey) === -1);
+        return !!(w &&
+            w.data &&
+            w.data.filterkey &&
+            v &&
+            v.length > 0 &&
+            !this.isFilterMatch(w.data.filterkey, v));
     },
     calcCommonStyle:    function (recalc) {
         if (!this.commonStyle || recalc) {
@@ -2521,11 +2522,20 @@ var vis = {
         return result;
     },
     extractBinding:     function (format, doNotIgnoreEditMode) {
+        var cached = this._cachedBinding(format, doNotIgnoreEditMode);
+        // Public entry point: widget sets (materialdesign, timeandweather) call it and
+        // keep parts of the result, so they get a copy they may change freely.
+        return cached ? JSON.parse(JSON.stringify(cached)) : cached;
+    },
+    // The cached descriptors themselves, NOT a copy - for callers that only read them.
+    // formatBinding() is the hot one: a single theme switch of this project runs it
+    // 100 times, and cloning every descriptor on each run was pure allocation.
+    _cachedBinding:     function (format, doNotIgnoreEditMode) {
         if ((!doNotIgnoreEditMode && this.editMode) || !format) {
             return null;
         }
         if (this.bindingsCache[format]) {
-            return JSON.parse(JSON.stringify(this.bindingsCache[format]));
+            return this.bindingsCache[format];
         }
 
         var result = extractBinding(format);
@@ -2533,7 +2543,7 @@ var vis = {
         // cache bindings
         if (result) {
             this.bindingsCache = this.bindingsCache || {};
-            this.bindingsCache[format] = JSON.parse(JSON.stringify(result));
+            this.bindingsCache[format] = result;
         }
 
         return result;
@@ -2559,7 +2569,7 @@ var vis = {
         }
     },
     formatBinding:      function (format, view, wid, widget, doNotIgnoreEditMode) {
-        var oids = this.extractBinding(format, doNotIgnoreEditMode);
+        var oids = this._cachedBinding(format, doNotIgnoreEditMode);
         for (var t = 0; t < oids.length; t++) {
             var value;
             if (oids[t].visOid) {
@@ -3157,10 +3167,15 @@ var vis = {
                 var widget = this.views[this.bindings[id][i].view].widgets[this.bindings[id][i].widget];
                 var value = this.formatBinding(this.bindings[id][i].format, this.bindings[id][i].view, this.bindings[id][i].widget, widget);
 
+                // The widget config is what renderWidget() builds the widget's can.Map
+                // from, so this one assignment carries the value into the re-render below.
+                // (A second line used to write a plain property literally named
+                // "data.<attr>" onto the vis.widgets wrapper - nothing ever read it. Setting
+                // the can.Map instead would let tplHtml update without a re-render, but it
+                // skips destroyWidget: the widget's data('destroy') would never run and
+                // htmlRefresh would keep repainting the old html. Measured gain: 5 ms per
+                // visible widget on a 4x throttled CPU. Not worth that.)
                 widget[this.bindings[id][i].type][this.bindings[id][i].attr] = value;
-                if (this.widgets[this.bindings[id][i].widget] && this.bindings[id][i].type === 'data') {
-                    this.widgets[this.bindings[id][i].widget][`${this.bindings[id][i].type}.${this.bindings[id][i].attr}`] = value;
-                }
 
                 this.subscribeOidAtRuntime(value);
                 this.visibilityOidBinding(this.bindings[id][i], value);
