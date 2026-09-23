@@ -3,7 +3,7 @@
 // Browsers cache this file for up to staticAssetCacheMaxAge (1h here), so a device may
 // still be running the previous version. Type visConnFork in the console to find out
 // which one it has.
-var visConnFork = 'reactions/2026-09-23';
+var visConnFork = 'reactions/2026-09-23.2';
 /* jshint browser: true */
 /* global document */
 /* global console */
@@ -73,7 +73,8 @@ var servConn = {
     _objects:           null,        // used if _useStorage === true
     _enums:             null,        // used if _useStorage === true
     _autoSubscribe:     true,
-    _subscribed:        [],          // every state pattern subscribed on this connection
+    _subscribed:        new Set(),   // every state pattern subscribed on this connection
+    _authEnabledAnswer: null,        // answer of the authEnabled call in _onAuth, see getLoggedUser
     _getStatesQueue:    [],          // getStates calls waiting for the running one
     namespace:          'vis.0',
 
@@ -166,8 +167,8 @@ var servConn = {
         // vis re-subscribes only the IDs of its native widgets after a reconnect, so
         // without this the dashboards keep their values frozen and nobody notices -
         // until now only the forced page reload covered this up.
-        if (this._subscribed.length) {
-            this._socket.emit('subscribe', this._subscribed.slice());
+        if (this._subscribed.size) {
+            this._socket.emit('subscribe', Array.from(this._subscribed));
         }
 
         if (this._isConnected === true) {
@@ -181,7 +182,15 @@ var servConn = {
             setTimeout(function () {
                 that._socket.emit('authEnabled', function (auth, user) {
                     that._user = user;
-                    that._connCallbacks.onConnChange(that._isConnected);
+                    // vis asks the very same question in onConnChange via getLoggedUser
+                    // right away - one roundtrip per (re)connect for an answer we hold.
+                    // Hand it over for that one call only; no cache survives this call.
+                    that._authEnabledAnswer = [auth, user];
+                    try {
+                        that._connCallbacks.onConnChange(that._isConnected);
+                    } finally {
+                        that._authEnabledAnswer = null;
+                    }
                     typeof app !== 'undefined' && app.onConnChange(that._isConnected);
                 });
             }, 0);
@@ -477,16 +486,22 @@ var servConn = {
                 }
             }
 
-            var lastHandledSocket = null;
+            // Number of the last restored WebSocket - a number and not the object itself,
+            // which would keep one dead socket alive for the rest of the session.
+            var lastHandledSocket = 0;
+            var socketSeq = 0;
 
             var onConnect = function () {
                 var raw = that._socket ? that._socket.socket : null; // the real WebSocket
                 if (raw) {
-                    if (raw === lastHandledSocket) {
+                    if (!raw._visConnSeq) {
+                        raw._visConnSeq = ++socketSeq;
+                    }
+                    if (raw._visConnSeq === lastHandledSocket) {
                         // same connection, already restored
                         return;
                     }
-                    lastHandledSocket = raw;
+                    lastHandledSocket = raw._visConnSeq;
                     // This is a DIFFERENT connection than the one restored last: while we
                     // were busy the client may have thrown its socket away and opened a
                     // new one. Force the full restore for it, because _onAuth() bails out
@@ -542,7 +557,10 @@ var servConn = {
                 that._socket.emit('name', connOptions.name);
                 console.log(new Date().toISOString() + ' Connected => authenticate');
 
-                setTimeout(function () {
+                // This used to wait a fixed 50 ms first. Nothing needs it: the server
+                // handles 'name' synchronously and keeps an early 'authenticate' pending
+                // until the user is known (socket._authPending). 50 ms per (re)connect.
+                (function () {
                     var timeOut = 6000;
                     // If online give more time
                     if (window.location.href.indexOf('iobroker.') !== -1) {
@@ -574,7 +592,7 @@ var servConn = {
                             console.log('permissionError');
                         }
                     });
-                }, 50);
+                })();
             };
 
             this._socket.on('connect', onConnect);
@@ -786,11 +804,12 @@ var servConn = {
             if (!list[i]) {
                 continue;
             }
-            var pos = this._subscribed.indexOf(list[i]);
+            // a Set: indexOf/splice made this O(n) per ID, 55 ms on a 4x throttled
+            // CPU for the ~1000 IDs a session collects
             if (remove) {
-                pos !== -1 && this._subscribed.splice(pos, 1);
-            } else if (pos === -1) {
-                this._subscribed.push(list[i]);
+                this._subscribed.delete(list[i]);
+            } else {
+                this._subscribed.add(list[i]);
             }
         }
     },
@@ -1042,6 +1061,13 @@ var servConn = {
         // connected, the emit does not throw, and the callback never arrives. For the
         // operator that means a tap on a light switch does nothing and says nothing.
         // Insist on an acknowledgement so at least the caller finds out.
+        //
+        // Deliberately NO resend. While the drop is still undetected nobody can tell
+        // whether the command arrived and only its answer got lost - repeating a
+        // toggle could switch twice. Once it is detected, the gap until the reconnect
+        // measures 7-8 ms with a reachable server; a queue would only ever act during
+        // a real outage, i.e. switch a light many seconds after the operator was told
+        // it failed and has maybe tapped again.
         var done = false;
         var timer = setTimeout(function () {
             if (done) {
@@ -1529,6 +1555,11 @@ var servConn = {
         }
     },
     getLoggedUser:    function (callback) {
+        var answer = this._authEnabledAnswer;
+        if (answer) {
+            this._authEnabledAnswer = null;
+            return callback && callback(answer[0], answer[1]);
+        }
         this._socket.emit('authEnabled', callback);
     },
     // return time when the objects were synchronized
