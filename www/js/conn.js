@@ -3,7 +3,7 @@
 // Browsers cache this file for up to staticAssetCacheMaxAge (1h here), so a device may
 // still be running the previous version. Type visConnFork in the console to find out
 // which one it has.
-var visConnFork = 'reactions/2026-09-22';
+var visConnFork = 'reactions/2026-09-23';
 /* jshint browser: true */
 /* global document */
 /* global console */
