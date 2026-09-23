@@ -134,8 +134,11 @@ function extractBinding(format) {
                             _visOid = _visOid + '.val';
                         }
 
-                        test1 = systemOid.substring(_systemOid.length - 4);
-                        test2 = systemOid.substring(_systemOid.length - 3);
+                        // _systemOid, not systemOid: that one is the FIRST operand, so the
+                        // suffix of every further operand was tested at a wrong offset in
+                        // a different string and ".val"/".ts" stayed in its object ID
+                        test1 = _systemOid.substring(_systemOid.length - 4);
+                        test2 = _systemOid.substring(_systemOid.length - 3);
 
                         if (test1 === '.val' || test1 === '.ack') {
                             _systemOid = _systemOid.substring(0, _systemOid.length - 4);
